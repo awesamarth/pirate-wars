@@ -95,7 +95,9 @@ function encodeDuelMove(playerNum: number, move: DuelMove): string {
     case "shield":
       return `p${playerNum}s${move.hitbox}`;
     case "double_turn":
-      return `p${playerNum}h${move.targetHitbox1}_dth${move.targetHitbox2}`;
+      return move.shieldHitbox
+        ? `p${playerNum}h${move.targetHitbox1}_dts${move.shieldHitbox}`
+        : `p${playerNum}h${move.targetHitbox1}_dth${move.targetHitbox2}`;
   }
 }
 
@@ -138,19 +140,34 @@ function randomInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+const DRAW = "draw";
+
 function checkThreePlayerWin(players: ThreePlayerPlayer[]): string | null {
   const alive = players.filter((p) => !p.isEliminated);
-  return alive.length === 1 ? alive[0].userId : null;
+  if (alive.length === 1) return alive[0].userId;
+  if (alive.length === 0) return DRAW;
+  return null;
 }
 
 function checkDuelWin(players: [DuelPlayer, DuelPlayer]): string | null {
   const alive = players.filter((p) => !p.isEliminated);
-  return alive.length === 1 ? alive[0].userId : null;
+  if (alive.length === 1) return alive[0].userId;
+  if (alive.length === 0) return DRAW;
+  return null;
 }
 
-function endGame(io: Server, game: GameState, winnerId: string): void {
+/** Strips non-serializable fields (Maps) before sending over socket. */
+function serializeGame(game: GameState): object {
+  const { pendingMoves: _pm, ...rest } = game as any;
+  return rest;
+}
+
+function endGame(io: Server, game: GameState, winnerId: string | null, finalNotations?: string[]): void {
   game.gameStatus = "ended";
   game.winner = winnerId;
+  if (finalNotations) {
+    io.to(game.roomId).emit("turn_resolved", { notations: finalNotations, gameState: serializeGame(game) });
+  }
   io.to(game.roomId).emit("game_ended", { winner: winnerId, history: game.moveHistory });
   games.delete(game.roomId);
 }
@@ -233,12 +250,15 @@ function resolveThreePlayerTurn(io: Server, game: GameState & ThreePlayerState):
   const { roomId, players, pendingMoves } = game;
   const turnNotations: string[] = [];
 
+  // Who was alive before this turn started
+  const aliveAtTurnStartPass1 = new Set(players.filter((p) => !p.isEliminated).map((p) => p.userId));
+
   // Pass 1: apply gun jams so they take effect on attacks this same turn
-  for (const [userId, move] of pendingMoves) {
+  for (const [userId, move] of Array.from(pendingMoves)) {
     if (move.powerUp?.type !== "gun_jam") continue;
     const actorIdx = players.findIndex((p) => p.userId === userId);
     const actor = players[actorIdx];
-    if (actor.isEliminated) continue;
+    if (!aliveAtTurnStartPass1.has(actor.userId)) continue;
 
     const jamTargetIdx = (move.powerUp.jamTarget ?? 0) - 1;
     if (jamTargetIdx >= 0 && jamTargetIdx < players.length && jamTargetIdx !== actorIdx) {
@@ -247,18 +267,21 @@ function resolveThreePlayerTurn(io: Server, game: GameState & ThreePlayerState):
     actor.powerUpsUsed++;
   }
 
+  // Track who was alive at the START of this turn (before any attacks land)
+  const aliveAtTurnStart = new Set(players.filter((p) => !p.isEliminated).map((p) => p.userId));
+
   // Pass 2: resolve all attacks
-  for (const [userId, move] of pendingMoves) {
+  for (const [userId, move] of Array.from(pendingMoves)) {
     const actorIdx = players.findIndex((p) => p.userId === userId);
     const actor = players[actorIdx];
-    if (actor.isEliminated) continue;
+    if (!aliveAtTurnStart.has(actor.userId)) continue;
 
     const actorNum = actorIdx + 1;
     const { targetPlayerNum, targetHitbox, powerUp } = move;
     const targetIdx = targetPlayerNum - 1;
     const target = players[targetIdx];
 
-    if (!target || target.isEliminated || targetIdx === actorIdx) continue;
+    if (!target || !aliveAtTurnStart.has(target.userId) || targetIdx === actorIdx) continue;
 
     // Gun jam check (67% fail, 33% backfire)
     if (actor.isGunJammed) {
@@ -280,18 +303,18 @@ function resolveThreePlayerTurn(io: Server, game: GameState & ThreePlayerState):
     if (powerUp && powerUp.type !== "gun_jam") actor.powerUpsUsed++;
 
     const targetHitboxIdx = targetHitbox - 1;
-    if (target.hitboxes[targetHitboxIdx] <= 0) continue;
-
-    if (powerUp?.type === "double_damage") {
-      destroyHitbox(target, targetHitboxIdx);
-      const others = aliveHitboxIndices(target).filter((i) => i !== targetHitboxIdx);
-      if (others.length > 0) destroyHitbox(target, others[randomInt(0, others.length - 1)]);
-    } else {
-      // shield powerup: attack still goes through, shield is recorded in notation
-      destroyHitbox(target, targetHitboxIdx);
-    }
 
     turnNotations.push(encodeThreePlayerMove(actorNum, targetPlayerNum, targetHitbox, powerUp));
+
+    if (target.hitboxes[targetHitboxIdx] > 0) {
+      if (powerUp?.type === "double_damage") {
+        destroyHitbox(target, targetHitboxIdx);
+        destroyHitbox(target, targetHitboxIdx);
+      } else {
+        // shield powerup: attack still goes through, shield is recorded in notation
+        destroyHitbox(target, targetHitboxIdx);
+      }
+    }
 
     if (target.isEliminated) {
       io.to(roomId).emit("player_eliminated", { userId: target.userId });
@@ -303,9 +326,9 @@ function resolveThreePlayerTurn(io: Server, game: GameState & ThreePlayerState):
   game.turnDeadline = Date.now() + TURN_TIMEOUT_MS;
 
   const winner = checkThreePlayerWin(players);
-  if (winner) { endGame(io, game, winner); return; }
+  if (winner) { endGame(io, game, winner, turnNotations); return; }
 
-  io.to(roomId).emit("turn_resolved", { notations: turnNotations, gameState: game });
+  io.to(roomId).emit("turn_resolved", { notations: turnNotations, gameState: serializeGame(game) });
 }
 
 // ---------------------------------------------------------------------------
@@ -352,12 +375,16 @@ function resolveDuelTurn(io: Server, game: GameState & DuelState): void {
   if ((move1.type === "attack" && move1.powerUp) || move1.type === "double_turn") p1.powerUpsUsed++;
   if ((move2.type === "attack" && move2.powerUp) || move2.type === "double_turn") p2.powerUpsUsed++;
 
-  const p1ShieldedHitbox = move1.type === "shield" ? move1.hitbox : null;
-  const p2ShieldedHitbox = move2.type === "shield" ? move2.hitbox : null;
+  const p1ShieldedHitbox = move1.type === "shield" ? move1.hitbox : move1.type === "double_turn" && move1.shieldHitbox ? move1.shieldHitbox : null;
+  const p2ShieldedHitbox = move2.type === "shield" ? move2.hitbox : move2.type === "double_turn" && move2.shieldHitbox ? move2.shieldHitbox : null;
   const bothShielded = move1.type === "shield" && move2.type === "shield";
 
   applyDuelMove(io, game, p1, p2, move1, 1, p2ShieldedHitbox, turnNotations);
   applyDuelMove(io, game, p2, p1, move2, 2, p1ShieldedHitbox, turnNotations);
+
+  // Clear jam state after turn resolves
+  p1.isGunJammed = false;
+  p2.isGunJammed = false;
 
   // Poseidon's Wrath
   if (bothShielded) {
@@ -384,10 +411,10 @@ function resolveDuelTurn(io: Server, game: GameState & DuelState): void {
   game.moveHistory.push(...turnNotations);
 
   const winner = checkDuelWin(players);
-  if (winner) { endGame(io, game, winner); return; }
+  if (winner) { endGame(io, game, winner, turnNotations); return; }
 
   game.turnDeadline = Date.now() + TURN_TIMEOUT_MS;
-  io.to(roomId).emit("turn_resolved", { notations: turnNotations, gameState: game });
+  io.to(roomId).emit("turn_resolved", { notations: turnNotations, gameState: serializeGame(game) });
 }
 
 function countPoseidonStrikes(consecutiveTurns: number): number {
@@ -407,11 +434,12 @@ function applyDuelMove(
   targetShieldedHitbox: number | null,
   notations: string[]
 ): void {
-  notations.push(encodeDuelMove(actorNum, move));
+  if (move.type === "shield") {
+    notations.push(encodeDuelMove(actorNum, move));
+    return;
+  }
 
-  if (move.type === "shield") return;
-
-  // Gun jam check
+  // If actor was jammed from a previous turn, their shot misfires
   if (actor.isGunJammed) {
     actor.isGunJammed = false;
     if (Math.random() < 0.67) {
@@ -427,27 +455,46 @@ function applyDuelMove(
     return;
   }
 
+  notations.push(encodeDuelMove(actorNum, move));
+
   if (move.type === "attack") {
     const hitboxIdx = move.targetHitbox - 1;
     if (targetShieldedHitbox !== null && move.targetHitbox === targetShieldedHitbox) return; // blocked by shield
 
     if (move.powerUp === "double_damage") {
       destroyHitbox(target, hitboxIdx);
-      const others = aliveHitboxIndices(target).filter((i) => i !== hitboxIdx);
-      if (others.length > 0) destroyHitbox(target, others[randomInt(0, others.length - 1)]);
-    } else if (move.powerUp === "gun_jam") {
       destroyHitbox(target, hitboxIdx);
-      target.isGunJammed = true;
+    } else if (move.powerUp === "gun_jam") {
+      // 67% success: attack lands + target jammed next turn
+      // 33% backfire: attack doesn't land, actor takes damage instead
+      if (Math.random() < 0.67) {
+        destroyHitbox(target, hitboxIdx);
+        target.isGunJammed = true;
+      } else {
+        const alive = aliveHitboxIndices(actor);
+        if (alive.length > 0) {
+          const h = alive[randomInt(0, alive.length - 1)];
+          destroyHitbox(actor, h);
+          notations.push(`p${actorNum}_backfire_h${h + 1}`);
+        }
+      }
     } else {
       destroyHitbox(target, hitboxIdx);
     }
   }
 
   if (move.type === "double_turn") {
-    const h1 = move.targetHitbox1 - 1;
-    const h2 = move.targetHitbox2 - 1;
-    if (targetShieldedHitbox === null || move.targetHitbox1 !== targetShieldedHitbox) destroyHitbox(target, h1);
-    if (targetShieldedHitbox === null || move.targetHitbox2 !== targetShieldedHitbox) destroyHitbox(target, h2);
+    if (move.shieldHitbox !== undefined) {
+      // Attack + shield mode: one attack only
+      const h1 = move.targetHitbox1 - 1;
+      if (targetShieldedHitbox === null || move.targetHitbox1 !== targetShieldedHitbox) destroyHitbox(target, h1);
+    } else {
+      // Attack x2 mode
+      const h1 = move.targetHitbox1 - 1;
+      const h2 = move.targetHitbox2 - 1;
+      if (targetShieldedHitbox === null || move.targetHitbox1 !== targetShieldedHitbox) destroyHitbox(target, h1);
+      if (targetShieldedHitbox === null || move.targetHitbox2 !== targetShieldedHitbox) destroyHitbox(target, h2);
+    }
   }
 
   if (target.isEliminated) {
@@ -534,7 +581,7 @@ function tryMatchThreePlayers(io: Server, queue: WaitingPlayer[]): void {
   for (const p of [p1, p2, p3]) {
     io.sockets.sockets.get(p.socketId)?.join(roomId);
   }
-  io.to(roomId).emit("match_found", game);
+  io.to(roomId).emit("match_found", serializeGame(game));
 }
 
 function tryMatchDuel(io: Server, queue: WaitingPlayer[]): void {
@@ -566,7 +613,7 @@ function tryMatchDuel(io: Server, queue: WaitingPlayer[]): void {
   for (const p of [p1, p2]) {
     io.sockets.sockets.get(p.socketId)?.join(roomId);
   }
-  io.to(roomId).emit("match_found", game);
+  io.to(roomId).emit("match_found", serializeGame(game));
 }
 
 /**
@@ -577,7 +624,8 @@ function createPracticeGame(
   io: Server,
   humanPlayer: WaitingPlayer,
   gameMode: GameMode,
-  difficulty: Difficulty
+  difficulty: Difficulty,
+  socket: any
 ): string {
   const roomId = Date.now().toString();
 
@@ -612,8 +660,8 @@ function createPracticeGame(
     };
 
     games.set(roomId, game);
-    io.sockets.sockets.get(humanPlayer.socketId)?.join(roomId);
-    io.to(roomId).emit("match_found", { ...game, difficulty });
+    socket.join(roomId);
+    socket.emit("match_found", { ...serializeGame(game), difficulty });
   } else {
     const bot: DuelPlayer = {
       userId: `bot_${roomId}`,
@@ -646,8 +694,8 @@ function createPracticeGame(
     };
 
     games.set(roomId, game);
-    io.sockets.sockets.get(humanPlayer.socketId)?.join(roomId);
-    io.to(roomId).emit("match_found", { ...game, difficulty });
+    socket.join(roomId);
+    socket.emit("match_found", { ...serializeGame(game), difficulty });
   }
 
   return roomId;
@@ -726,7 +774,8 @@ app.prepare().then(() => {
           io,
           { userId, username, socketId: socket.id, participantType: "human" },
           gameMode,
-          difficulty
+          difficulty,
+          socket
         );
 
         socket.data.difficulty = difficulty;
@@ -746,7 +795,7 @@ app.prepare().then(() => {
         socket.data.userId = userId;
         userIdToSocket.set(userId, socket.id);
         socket.join(roomId);
-        socket.emit("game_data", game);
+        socket.emit("game_data", serializeGame(game));
       }
     );
 
@@ -790,7 +839,7 @@ app.prepare().then(() => {
     socket.on("get_game_state", ({ roomId }: { roomId: string }) => {
       const game = games.get(roomId);
       if (!game) { socket.emit("game_state", { error: "Game not found" }); return; }
-      socket.emit("game_state", game);
+      socket.emit("game_state", serializeGame(game));
     });
 
     // -----------------------------------------------------------------------

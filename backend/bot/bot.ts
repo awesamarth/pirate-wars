@@ -1,8 +1,17 @@
 /**
  * Bot logic for practice mode.
  *
- * getBotMove() returns a random valid move for the given game state.
- * Future difficulty levels (medium, hard) can be added here with smarter strategies.
+ * Difficulty behaviour:
+ *
+ * DUEL (1v1):
+ *   easy   — bot always shields one of its remaining hitboxes
+ *   medium — 2/3 chance shield, 1/3 chance attack player's hitbox
+ *   hard   — always attacks player's hitbox (no shielding)
+ *
+ * THREE-PLAYER (1v1v1):
+ *   easy   — bots attack each other; once only 1 bot left vs player, it attacks player
+ *   medium — 50% chance each bot targets player, 50% chance targets the other bot
+ *   hard   — 80% chance each bot targets player, 20% chance targets the other bot
  */
 
 import type {
@@ -21,55 +30,15 @@ function randomInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+/** Returns 1-indexed alive hitbox numbers for a player. */
 function aliveHitboxes(player: { hitboxes: number[] }): number[] {
   return player.hitboxes
-    .map((hp, i) => (hp > 0 ? i + 1 : -1)) // 1-indexed
+    .map((hp, i) => (hp > 0 ? i + 1 : -1))
     .filter((i) => i !== -1);
 }
 
-// ---------------------------------------------------------------------------
-// Three-player bot
-// ---------------------------------------------------------------------------
-
-export function getBotMoveThreePlayer(
-  botUserId: string,
-  players: ThreePlayerPlayer[],
-  _difficulty: Difficulty
-): ThreePlayerMove {
-  const botIdx = players.findIndex((p) => p.userId === botUserId);
-  const bot = players[botIdx];
-
-  // Pick a random living opponent
-  const opponents = players.filter((p) => !p.isEliminated && p.userId !== botUserId);
-  const target = opponents[randomInt(0, opponents.length - 1)];
-  const targetPlayerNum = players.indexOf(target) + 1; // 1-indexed
-
-  // Pick a random alive hitbox on that opponent
-  const targetHitboxes = aliveHitboxes(target);
-  const targetHitbox = targetHitboxes[randomInt(0, targetHitboxes.length - 1)];
-
-  // Occasionally use a powerup if still have budget (easy: ~20% chance)
-  if (bot.powerUpsUsed < 2 && Math.random() < 0.2) {
-    const powerUps = ["double_damage", "shield", "gun_jam"] as const;
-    const type = powerUps[randomInt(0, powerUps.length - 1)];
-
-    if (type === "shield") {
-      // Shield a random alive hitbox of self
-      const selfHitboxes = aliveHitboxes(bot);
-      const shieldHitbox = selfHitboxes[randomInt(0, selfHitboxes.length - 1)];
-      return { targetPlayerNum, targetHitbox, powerUp: { type, shieldHitbox } };
-    }
-
-    if (type === "gun_jam") {
-      // Jam a random opponent (not self, not the attack target — variety)
-      const jamTarget = players.indexOf(target) + 1;
-      return { targetPlayerNum, targetHitbox, powerUp: { type, jamTarget } };
-    }
-
-    return { targetPlayerNum, targetHitbox, powerUp: { type } };
-  }
-
-  return { targetPlayerNum, targetHitbox };
+function pickRandom<T>(arr: T[]): T {
+  return arr[randomInt(0, arr.length - 1)];
 }
 
 // ---------------------------------------------------------------------------
@@ -79,43 +48,93 @@ export function getBotMoveThreePlayer(
 export function getBotMoveDuel(
   botUserId: string,
   players: [DuelPlayer, DuelPlayer],
-  _difficulty: Difficulty
+  difficulty: Difficulty
 ): DuelMove {
   const bot = players.find((p) => p.userId === botUserId)!;
   const opponent = players.find((p) => p.userId !== botUserId)!;
 
-  const roll = Math.random();
+  const botAlive = aliveHitboxes(bot);
+  const opponentAlive = aliveHitboxes(opponent);
 
-  // ~15% chance to shield a random alive hitbox
-  if (roll < 0.15) {
-    const selfHitboxes = aliveHitboxes(bot);
-    const hitbox = selfHitboxes[randomInt(0, selfHitboxes.length - 1)];
-    return { type: "shield", hitbox };
-  }
-
-  // ~15% chance to use a powerup if budget allows
-  if (roll < 0.30 && bot.powerUpsUsed < 2) {
-    const opponentHitboxes = aliveHitboxes(opponent);
-    const targetHitbox = opponentHitboxes[randomInt(0, opponentHitboxes.length - 1)];
-
-    const powerUps = ["double_damage", "gun_jam", "double_turn"] as const;
-    const type = powerUps[randomInt(0, powerUps.length - 1)];
-
-    if (type === "double_turn") {
-      // Pick 2 distinct alive hitboxes
-      if (opponentHitboxes.length >= 2) {
-        const shuffled = [...opponentHitboxes].sort(() => Math.random() - 0.5);
-        return { type: "double_turn", targetHitbox1: shuffled[0], targetHitbox2: shuffled[1] };
-      }
-      // Fallback to regular attack if only 1 hitbox left
-      return { type: "attack", targetHitbox };
+  switch (difficulty) {
+    case "easy": {
+      // Always shield a random alive hitbox
+      return { type: "shield", hitbox: pickRandom(botAlive) };
     }
 
-    return { type: "attack", targetHitbox, powerUp: type };
+    case "medium": {
+      // 0 or 1 → shield, 2 → attack
+      const roll = randomInt(0, 2);
+      if (roll <= 1) {
+        return { type: "shield", hitbox: pickRandom(botAlive) };
+      }
+      return { type: "attack", targetHitbox: pickRandom(opponentAlive) };
+    }
+
+    case "hard": {
+      // Always attack
+      return { type: "attack", targetHitbox: pickRandom(opponentAlive) };
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Three-player bot
+// ---------------------------------------------------------------------------
+
+export function getBotMoveThreePlayer(
+  botUserId: string,
+  players: ThreePlayerPlayer[],
+  difficulty: Difficulty
+): ThreePlayerMove {
+  const botIdx = players.findIndex((p) => p.userId === botUserId);
+  const bot = players[botIdx];
+
+  const humanPlayer = players.find((p) => p.participantType === "human" && !p.isEliminated);
+  const otherBots = players.filter(
+    (p) => p.userId !== botUserId && p.participantType === "ai" && !p.isEliminated
+  );
+  const alivePlayers = players.filter((p) => !p.isEliminated && p.userId !== botUserId);
+
+  // If no human left, bots attack each other (shouldn't really happen in practice mode)
+  if (!humanPlayer) {
+    const target = pickRandom(alivePlayers);
+    const targetPlayerNum = players.indexOf(target) + 1;
+    return { targetPlayerNum, targetHitbox: pickRandom(aliveHitboxes(target)) };
   }
 
-  // Default: plain attack on a random alive hitbox
-  const opponentHitboxes = aliveHitboxes(opponent);
-  const targetHitbox = opponentHitboxes[randomInt(0, opponentHitboxes.length - 1)];
-  return { type: "attack", targetHitbox };
+  const humanPlayerNum = players.indexOf(humanPlayer) + 1;
+  const humanHitboxes = aliveHitboxes(humanPlayer);
+
+  switch (difficulty) {
+    case "easy": {
+      // Attack other bots if any alive, otherwise attack player
+      if (otherBots.length > 0) {
+        const target = pickRandom(otherBots);
+        const targetPlayerNum = players.indexOf(target) + 1;
+        return { targetPlayerNum, targetHitbox: pickRandom(aliveHitboxes(target)) };
+      }
+      return { targetPlayerNum: humanPlayerNum, targetHitbox: pickRandom(humanHitboxes) };
+    }
+
+    case "medium": {
+      // 50/50: attack player or attack another bot
+      if (otherBots.length > 0 && Math.random() < 0.5) {
+        const target = pickRandom(otherBots);
+        const targetPlayerNum = players.indexOf(target) + 1;
+        return { targetPlayerNum, targetHitbox: pickRandom(aliveHitboxes(target)) };
+      }
+      return { targetPlayerNum: humanPlayerNum, targetHitbox: pickRandom(humanHitboxes) };
+    }
+
+    case "hard": {
+      // 80% attack player, 20% attack another bot
+      if (otherBots.length > 0 && Math.random() > 0.8) {
+        const target = pickRandom(otherBots);
+        const targetPlayerNum = players.indexOf(target) + 1;
+        return { targetPlayerNum, targetHitbox: pickRandom(aliveHitboxes(target)) };
+      }
+      return { targetPlayerNum: humanPlayerNum, targetHitbox: pickRandom(humanHitboxes) };
+    }
+  }
 }

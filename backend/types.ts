@@ -40,7 +40,7 @@ export type DuelPowerUp = "double_damage" | "gun_jam";
 export type DuelMove =
   | { type: "attack"; targetHitbox: number; powerUp?: DuelPowerUp }
   | { type: "shield"; hitbox: number }
-  | { type: "double_turn"; targetHitbox1: number; targetHitbox2: number };
+  | { type: "double_turn"; targetHitbox1: number; targetHitbox2: number; shieldHitbox?: number };
 
 export interface DuelPlayer {
   userId: string;

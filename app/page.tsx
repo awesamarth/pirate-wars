@@ -304,7 +304,7 @@ export default function Home() {
               <button
                 className="menu-btn w-56 py-4 text-base"
                 disabled={!canStart}
-                onClick={() => router.push(`/practice/game?mode=${practiceMode}&difficulty=${difficulty}`)}
+                onClick={() => { window.location.href = `/practice/game/${practiceMode === "1v1" ? "duel" : "three-player"}/${difficulty}`; }}
               >
                 Set Sail
               </button>
